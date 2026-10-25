@@ -1,0 +1,933 @@
+"""Rescale + regrade the Atlantian plaza scene and build the generated city from build/build.json.
+
+    node citygen_cli.js plan.json build/build.json
+    then in Blender: exec this file with BUILD_PATH set (or let it find build/build.json beside it)
+
+regrade()  puts the hand-built scene on the plan: first the scale, then the terrain.
+           scale    the hero opener (walkway + oculus, avenue kit, facades, trees, skywalk, camera)
+                    moves outward along the hero avenue as one piece; the hand-built rings are remapped
+                    radially (canals keep their width), small kit parts like bollards move whole
+           terrain  decks/risers/canal walls: per-vertex ladder remap; water: lifted flat;
+                    paving strips: follow the slope; buildings: level on a plinth; small things: on
+                    the ground; temple: lifted with the plateau
+           Every touched object keeps its original state (object prop / mesh attribute / curve prop),
+           so rerunning with a different plan starts from the original scene.
+build()    rebuilds the generated collections. Trees are point clouds instanced by Geometry Nodes, as
+           one ~16-tri distance tree per species (KIT_PlantD_*, in excluded KIT_PLANT_DISTANCE) for
+           viewport and render alike; the detailed asset_Plant_* kits stay untouched for hero trees.
+           The pine (asset_Plant_pine, Indigo's arcology) has no kit: its distance tree is procedural.
+ensure_glow()  MAT_AP_Glow, the Lantern's emissive cyan heart (MAT_AP_Cyan is shared and stays non-emissive).
+ground_palette()  basic colours: asphalt roads, sandstone pavers, deep sea-teal water, and materials for the bare ground
+           rings (orchard grass-and-dirt for the college ring, meadow for the greenbelt, pavers outside).
+college_palette()  colours for the colleges' materials (ashlar, verdigris, timber, brick, plasters, roof tile, canvas, dye).
+hide_temple()  the old temple (05_TEMPLE, KIT_PlantI_temple_*) is hidden, never deleted: Old Town replaces it.
+hide_centre_strays()  after the build, any other visible hand-built object reaching inside the first ring
+           canal (bar its water, AP_inner_water, and bank, KIT_Terrace_island) is reported and hidden the same way.
+"""
+import bpy, json, math, os
+from mathutils import Vector
+
+_here = os.path.dirname(globals().get("__file__", "") or ".")
+BUILD = globals().get("BUILD_PATH") or os.path.join(_here, "build", "build.json")
+with open(BUILD) as fh:
+    B = json.load(fh)
+CX, CY = B["center"]
+T = B["terrain"]
+STEP = T["step"]
+OLD = T["old_levels"]
+RS = T.get("rescale") or {"knots": [[0, 0], [1, 1]], "old_rings": {}, "hero_shift": 0, "hero_half": 0, "hero_r_min_old": 1e9}
+HERO_DIR = Vector((math.cos(T["hero_angle"]), math.sin(T["hero_angle"]), 0))
+WATER_BANDS = [tuple(b) for b in B["water_bands"]]
+
+COLL = {"outer": "20_NBHD_OUTER", "belt": "21_NBHD_BELT", "park": "22_NBHD_PARK", "core": "23_NBHD_CORE",
+        "spokes": "24_SPOKES", "avenues": "25_RING_AVENUES", "skywalks": "26_SKYWALKS", "regrade": "19_REGRADE_PLINTHS"}
+MAT = {"stone": "MAT_AP_Stone", "plinth": "MAT_AP_StoneWell", "lip": "MAT_AP_StoneLip", "roof": "MAT_AP_Grass",
+       "paver": "MAT_AP_Paver", "water": "MAT_AP_Water", "road": "MAT_AP_Grout", "stair": "MAT_AP_StoneLip",
+       "glass": "MAT_AP_Cyan", "tile": "MAT_AP_Bronze", "panel": "MAT_AP_Cyan", "fabric": "MAT_AP_StoneLip",
+       "glow": "MAT_AP_Glow", "gold": "MAT_AP_Gold",
+       "ashlar": "MAT_AP_Ashlar", "copper": "MAT_AP_Verdigris", "timber": "MAT_AP_Timber", "brick": "MAT_AP_Brick",
+       "plaster_a": "MAT_AP_PlasterOchre", "plaster_b": "MAT_AP_PlasterRose", "plaster_c": "MAT_AP_PlasterTeal",
+       "rooftile": "MAT_AP_RoofTile", "canvas": "MAT_AP_Canvas", "dye": "MAT_AP_DyeBed",
+       "clerestory": "MAT_AP_Clerestory", "turf": "MAT_AP_Turf", "boardwalk": "MAT_AP_Boardwalk"}  # new keys go at the END: the material index is the key's position
+MAT_KEYS = list(MAT)
+
+
+# ---------------------------------------------------------------- lookups
+def table(name, r):
+    t = T[name]
+    f = min(max(r / STEP, 0), len(t) - 1.001)
+    i = int(f)
+    return t[i] + (t[i + 1] - t[i]) * (f - i)
+
+
+def radius(x, y):
+    return math.hypot(x - CX, y - CY)
+
+
+def F(r):
+    """Old radius -> new radius (piecewise linear through the plan's knots)."""
+    k = RS["knots"]
+    for (a, fa), (b, fb) in zip(k, k[1:]):
+        if r <= b:
+            return fa + (r - a) * (fb - fa) / (b - a)
+    return r + (k[-1][1] - k[-1][0])
+
+
+def remap_xy(x, y):
+    r = radius(x, y)
+    if r < 1e-6:
+        return x, y
+    s = F(r) / r
+    return CX + (x - CX) * s, CY + (y - CY) * s
+
+
+def old_level(r_old):
+    """The flat deck level something stood on in the original scene, by its original radius."""
+    rings = RS["old_rings"]
+    for name, lvl in (("island", "island"), ("inner_water", "park"), ("park", "park"), ("canal2", "belt"),
+                      ("belt", "belt"), ("canal1", "promenade")):
+        if name in rings and r_old < rings[name][1]:
+            return OLD[lvl]
+    return OLD["promenade"]
+
+
+def is_water_new(r):
+    return any(r0 <= r < r1 for r0, r1 in WATER_BANDS)
+
+
+def delta_new(x, y):
+    """Things that keep their ring through the rescale: new ground minus the old deck there."""
+    return table("delta", radius(x, y))
+
+
+def delta_hero(x, y, r_old):
+    """The relocated hero opener: new ground where it lands minus the deck it originally stood on."""
+    r = radius(x, y)
+    return table("delta", r) if is_water_new(r) else table("G", r) - old_level(r_old)
+
+
+def ladder(r, z):
+    """Old stepped deck levels -> new sloped decks at radius r, interpolating walls between them."""
+    levels = [(OLD["promenade"], OLD["promenade"]), (OLD["belt"], table("belt", r)),
+              (OLD["park"], table("park", r)), (OLD["island"], table("island", r))]
+    if z <= levels[0][0]:
+        return z
+    for (lo, nlo), (hi, nhi) in zip(levels, levels[1:]):
+        if z <= hi:
+            return nlo + (z - lo) / (hi - lo) * (nhi - nlo)
+    return z + (levels[-1][1] - levels[-1][0])
+
+
+def world_matrix(o):
+    if o.parent:
+        return world_matrix(o.parent) @ o.matrix_parent_inverse @ o.matrix_basis
+    return o.matrix_basis.copy()
+
+
+def collection_of(o):
+    return o.users_collection[0].name if o.users_collection else ""
+
+
+GENERATED = set(COLL.values()) | {"27_CANAL_CUTS"}
+RING_KIT = {"01_GROUND", "03_CANALS", "10_KIT_CANAL", "11_TERRACE", "06_DOCKS_MARSH"}
+TERRAIN_COLLS = {"01_GROUND", "03_CANALS", "10_KIT_CANAL", "11_TERRACE", "08_BRIDGES"}
+WATER = {"AP_canal_2": "canal2", "AP_inner_water": "inner_water", "KIT_Canal2_water": "canal2"}
+STRIP_COLLS = {"07_STREET", "12_DECK_PAVE", "09_KIT_WALKWAY", "15_KIT_PLANT", "13_KIT_FACADE"}
+LEVEL_PREFIX = ("KIT_Facade_civic_i_", "AP_block_", "KIT_PlantI_vine_", "AP_vine", "AP_arc_", "KIT_Facade_slot_")
+SKIP = {"Camera_plan", "KIT_SkyBalcony_proto", "KIT_SkyWalk_L"}
+
+
+def is_source(o):
+    return any(c.name.startswith("asset_") for c in o.users_collection)
+
+
+# ---------------------------------------------------------------- originals (makes the pass rerunnable)
+SKIPPED = []
+
+
+def regraded():
+    return bool(bpy.context.scene.get("rg_done"))
+
+
+def restore_location(o):
+    """Back to the original transform. After the first regrade, an object with no stored original
+    was added or edited since: leave it alone rather than remap it a second time."""
+    if "rg_orig_loc" in o:
+        o.location = Vector(o["rg_orig_loc"])
+        return True
+    if regraded():
+        SKIPPED.append(o.name)
+        return False
+    o["rg_orig_loc"] = list(o.location)
+    return True
+
+
+def mesh_restore(me):
+    a = me.attributes.get("rg_orig_co")
+    co = [0.0] * (len(me.vertices) * 3)
+    if a is not None and len(a.data) == len(me.vertices):
+        a.data.foreach_get("vector", co)
+        me.vertices.foreach_set("co", co)
+        return True
+    else:
+        if regraded():  # geometry changed since the first regrade: don't treat it as original
+            SKIPPED.append(me.name)
+            return False
+        if a is not None:
+            me.attributes.remove(a)
+        me.vertices.foreach_get("co", co)
+        a = me.attributes.new("rg_orig_co", "FLOAT_VECTOR", "POINT")
+        a.data.foreach_set("vector", co)
+        return True
+
+
+def components(me):
+    """Loose parts of a mesh as lists of vertex indices (union-find over edges)."""
+    parent = list(range(len(me.vertices)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+    ev = [0] * (len(me.edges) * 2)
+    me.edges.foreach_get("vertices", ev)
+    for a, b in zip(ev[0::2], ev[1::2]):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+    groups = {}
+    for i in range(len(parent)):
+        groups.setdefault(find(i), []).append(i)
+    return list(groups.values())
+
+
+def transform_mesh(o, xy_fn, z_fn, rigid_parts=False):
+    """Restore the original vertices, then move them in world space: xy by xy_fn (per vertex, or per
+    loose part when rigid_parts so small kit pieces keep their shape), z by z_fn(x, y, z)."""
+    me = o.data
+    if me.users > 1:
+        o.data = me = me.copy()
+    if not mesh_restore(me):
+        return
+    mw = world_matrix(o)
+    inv = mw.inverted()
+    world = [mw @ v.co for v in me.vertices]
+    new_xy = [None] * len(world)
+    if rigid_parts:
+        for part in components(me):
+            pts = [world[i] for i in part]
+            cx = sum(p.x for p in pts) / len(pts)
+            cy = sum(p.y for p in pts) / len(pts)
+            ext = max(max(p.x for p in pts) - min(p.x for p in pts), max(p.y for p in pts) - min(p.y for p in pts))
+            if ext < 30:  # bollards, steps, posts: move whole
+                nx, ny = xy_fn(cx, cy)
+                for i in part:
+                    new_xy[i] = (world[i].x + nx - cx, world[i].y + ny - cy)
+            else:
+                for i in part:
+                    new_xy[i] = xy_fn(world[i].x, world[i].y)
+    else:
+        new_xy = [xy_fn(p.x, p.y) for p in world]
+    for v, p, (x, y) in zip(me.vertices, world, new_xy):
+        v.co = inv @ Vector((x, y, z_fn(x, y, p.z)))
+    me.update()
+
+
+def footprint_world(o):
+    mw = world_matrix(o)
+    if o.type == "EMPTY" and o.instance_collection:
+        pts = [Vector(c) for ob in o.instance_collection.all_objects if ob.type == "MESH" for c in ob.bound_box]
+        if not pts:
+            return [mw.translation]
+        xs, ys = [p.x for p in pts], [p.y for p in pts]
+        corners = [Vector((x, y, 0)) for x in (min(xs), max(xs)) for y in (min(ys), max(ys))]
+    elif o.type == "MESH" and o.data and len(o.data.vertices):
+        bb = [Vector(c) for c in o.bound_box]
+        corners = [Vector((x, y, 0)) for x in (min(p.x for p in bb), max(p.x for p in bb)) for y in (min(p.y for p in bb), max(p.y for p in bb))]
+    else:
+        return [mw.translation]
+    return [mw @ c for c in corners]
+
+
+def is_hero(o, p0):
+    """Part of the hand-built hero opener: in the avenue corridor, south of the island, not a ring kit."""
+    c = collection_of(o)
+    if c in RING_KIT or c == "05_TEMPLE" or o.name.startswith("KIT_Temple"):
+        return False
+    rel = Vector((p0.x - CX, p0.y - CY, 0))
+    along, across = rel.dot(HERO_DIR), abs(rel.x * HERO_DIR.y - rel.y * HERO_DIR.x)
+    if not (along > RS["hero_r_min_old"] and across < RS["hero_half"]):
+        return False
+    # only pieces that land on the stretch the hand-built kit still covers; the rest keep their ring
+    landed = along + RS["hero_shift"]
+    return any(a - 5 <= landed <= b + 5 for a, b in RS.get("hero_windows", [[0, 1e9]]))
+
+
+def depth(o):
+    n = 0
+    while o.parent:
+        o, n = o.parent, n + 1
+    return n
+
+
+def regrade():
+    stats = dict(hero=0, rings=0, water=0, strips=0, level=0, point=0, temple=0, curve=0)
+    plinths = []
+    shift = HERO_DIR * RS["hero_shift"]
+    handled = set()
+    for o in sorted(bpy.data.objects, key=depth):  # parents before children
+        c = collection_of(o)
+        if o.name in SKIP or c in GENERATED or o.get("citygen") or o.name.startswith("tmp_") or is_source(o) or (o.type == "LIGHT" and o.name != "Sun"):
+            continue
+        parent_done = o.parent is not None and o.parent.name in handled
+        if not parent_done and not restore_location(o):
+            continue
+        p0 = world_matrix(o).translation.copy()
+        r_old = radius(p0.x, p0.y)
+        hero = bool(o.parent.get("rg_hero", False)) if parent_done else is_hero(o, p0)
+        o["rg_hero"] = hero
+        handled.add(o.name)
+
+        # temple: stays at the centre, lifted with the plateau
+        if c == "05_TEMPLE" or o.name.startswith("KIT_Temple"):
+            if not parent_done:
+                o.location.z += T["templeLift"]
+            stats["temple"] += 1
+            continue
+
+        # the skypath drives the GN skywalk: move it with the opener and let it follow the slope
+        if o.type == "CURVE" and o.name.startswith("KIT_SkyPath"):
+            pts = [bp for s in o.data.splines for bp in s.bezier_points]
+            if "rg_orig_pts" not in o:
+                if regraded():
+                    SKIPPED.append(o.name)
+                    continue
+                o["rg_orig_pts"] = [list(bp.co) + list(bp.handle_left) + list(bp.handle_right) for bp in pts]
+            if len(o["rg_orig_pts"]) != len(pts):  # points added since: leave the curve as it is
+                SKIPPED.append(o.name)
+                continue
+            mw = world_matrix(o)
+            inv = mw.inverted()
+            for bp, orig in zip(pts, o["rg_orig_pts"]):
+                for attr, sl in (("co", slice(0, 3)), ("handle_left", slice(3, 6)), ("handle_right", slice(6, 9))):
+                    w0 = mw @ Vector(orig[sl])
+                    w = w0 + shift
+                    setattr(bp, attr, inv @ Vector((w.x, w.y, w.z + delta_hero(w.x, w.y, radius(w0.x, w0.y)))))
+            stats["curve"] += 1
+            continue
+
+        if hero:
+            # the hero opener moves out as one piece, then sits on the new ground
+            stats["hero"] += 1
+            rold = lambda x, y: radius(x - shift.x, y - shift.y)
+            if o.type == "MESH" and c in STRIP_COLLS and not o.name.startswith(LEVEL_PREFIX):
+                move = (lambda x, y: (x, y)) if parent_done else (lambda x, y: (x + shift.x, y + shift.y))
+                transform_mesh(o, move, lambda x, y, z: z + delta_hero(x, y, rold(x, y)))
+                stats["strips"] += 1
+                continue
+            if not parent_done:
+                o.location += shift
+            if o.type == "EMPTY" and not o.instance_collection and o.children:
+                continue
+            if o.name.startswith(LEVEL_PREFIX):
+                corners = footprint_world(o)
+                ds = [delta_hero(p.x, p.y, rold(p.x, p.y)) for p in corners]
+                z0 = world_matrix(o).translation.z
+                o.location.z += max(ds)
+                if max(ds) - min(ds) > 0.1 and not (o.hide_viewport or o.hide_get()):
+                    plinths.append(([(p.x, p.y) for p in corners], z0 + min(ds) - 0.3, z0 + max(ds)))
+                stats["level"] += 1
+                continue
+            if not parent_done:
+                p = world_matrix(o).translation
+                o.location.z += delta_hero(p.x, p.y, r_old)
+            stats["point"] += 1
+            continue
+
+        # everything else keeps its ring and is remapped radially
+        if o.type == "MESH" and o.name in WATER:
+            transform_mesh(o, remap_xy, lambda x, y, z: z)
+            mw = world_matrix(o)
+            zs = [(mw @ v.co).z for v in o.data.vertices]
+            o.location.z += T["water"][WATER[o.name]] - sum(zs) / len(zs)
+            stats["water"] += 1
+            continue
+        if o.type == "MESH" and c in TERRAIN_COLLS and not o.name.startswith(LEVEL_PREFIX):
+            transform_mesh(o, remap_xy, lambda x, y, z: ladder(radius(x, y), z), rigid_parts=True)
+            stats["rings"] += 1
+            continue
+        if o.type == "EMPTY" and not o.instance_collection and o.children:
+            continue  # kit parent empties stay; their children are remapped individually
+        if not parent_done:
+            nx, ny = remap_xy(p0.x, p0.y)
+            o.location.x += nx - p0.x
+            o.location.y += ny - p0.y
+        if o.type == "MESH" and c in STRIP_COLLS:
+            transform_mesh(o, lambda x, y: (x, y), lambda x, y, z: z + delta_new(x, y))
+            stats["strips"] += 1
+            continue
+        if o.name.startswith(LEVEL_PREFIX):
+            o.location.z += max(delta_new(p.x, p.y) for p in footprint_world(o))
+            stats["level"] += 1
+            continue
+        if not parent_done:
+            p = world_matrix(o).translation
+            o.location.z += delta_new(p.x, p.y)
+        stats["point"] += 1
+
+    cam = bpy.data.objects.get("Camera_plan")  # the plan camera frames the whole city
+    if cam and cam.data.type == "ORTHO":
+        cam.data.ortho_scale = 2 * max(r1 for _, r1 in B["land_bands"]) + 400
+    coll = reset_collection(COLL["regrade"])
+    if plinths:
+        mb = MeshBuilder()
+        for corners, z0, z1 in plinths:
+            cx = sum(x for x, _ in corners) / 4
+            cy = sum(y for _, y in corners) / 4
+            ring = sorted(corners, key=lambda p: math.atan2(p[1] - cy, p[0] - cx))
+            mb.prism([(x - CX, y - CY) for x, y in ring], z0, z1, MAT_KEYS.index("plinth"))
+        mb.emit("REGRADE_facade_plinths", coll)
+    bpy.context.scene["rg_done"] = True
+    print("regrade", stats, "plinths", len(plinths))
+    if SKIPPED:
+        print("skipped (no original state, edited after the first regrade):", SKIPPED[:20], "..." if len(SKIPPED) > 20 else "")
+
+
+# ---------------------------------------------------------------- build
+def get_mat(name):
+    return bpy.data.materials.get(name) or bpy.data.materials.new(name)
+
+
+def reset_collection(name):
+    c = bpy.data.collections.get(name)
+    if c is None:
+        c = bpy.data.collections.new(name)
+        bpy.context.scene.collection.children.link(c)
+    for o in list(c.all_objects):
+        me = o.data if o.type == "MESH" else None
+        bpy.data.objects.remove(o)
+        if me is not None and me.users == 0:
+            bpy.data.meshes.remove(me)
+    return c
+
+
+MATS = []
+# The Lantern heart: saturated cyan emission over a dark base. AgX (the scene's view transform) bleaches
+# bright emission toward white, so the strength stays low (8 rendered white, 1.5+ pale blue).
+GLOW_BASE, GLOW_EMIT, GLOW_STRENGTH = (0.0, 0.05, 0.08, 1.0), (0.0, 0.9, 1.0, 1.0), 0.8
+
+
+def ensure_glow():
+    """MAT_AP_Glow: emissive cyan. Creates or updates (idempotent); nodes found by type, never by name."""
+    m = get_mat("MAT_AP_Glow")
+    m.use_nodes = True
+    bsdf = next((n for n in m.node_tree.nodes if n.type == "BSDF_PRINCIPLED"), None) or m.node_tree.nodes.new("ShaderNodeBsdfPrincipled")
+    bsdf.inputs["Base Color"].default_value = GLOW_BASE
+    bsdf.inputs["Emission Color"].default_value = GLOW_EMIT
+    bsdf.inputs["Emission Strength"].default_value = GLOW_STRENGTH
+    if not any(n.type == "OUTPUT_MATERIAL" for n in m.node_tree.nodes):
+        out = m.node_tree.nodes.new("ShaderNodeOutputMaterial")
+        m.node_tree.links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
+    return m
+
+
+# Basic ground colours (linear RGB). The shared kit materials are set here so a rebuild keeps them.
+ROAD_COLOR = (0.11, 0.11, 0.115, 1.0)      # MAT_AP_Grout: avenue and spoke carriageways, asphalt grey
+PAVER_COLOR = (0.50, 0.45, 0.37, 1.0)      # MAT_AP_Paver: streets, quays, plazas, warm sandstone
+# MAT_AP_Water: was near-mirror (roughness 0.08) and mirrored the bright sky HDRI, so canals read white
+WATER = {"Base Color": (0.01, 0.10, 0.12, 1.0), "Roughness": 0.22, "Specular IOR Level": 0.35, "Transmission Weight": 0.0}
+GRASS_COLOR = (0.17, 0.33, 0.08, 1.0)
+DIRT_COLOR = (0.28, 0.18, 0.09, 1.0)
+# the hand-built ground and canal rings had no material at all (rendered as bare grey)
+GROUND = {"AP_park": "MAT_AP_GroundOrchard", "AP_greenbelt": "MAT_AP_GroundMeadow", "AP_promenade": "MAT_AP_Paver",
+          "AP_inner_water": "MAT_AP_Water", "AP_canal_2": "MAT_AP_Water"}
+
+
+def set_base_color(m, rgba):
+    m.use_nodes = True
+    bsdf = next((n for n in m.node_tree.nodes if n.type == "BSDF_PRINCIPLED"), None)
+    if bsdf is not None and not bsdf.inputs["Base Color"].is_linked:
+        bsdf.inputs["Base Color"].default_value = rgba
+    m.diffuse_color = rgba
+
+
+# The colleges' materials (linear RGB): Alder's warm Bath-stone ashlar, verdigris copper and lit clerestories,
+# Saffron's timber, turf roofs and boardwalks, Indigo's brick, plasters, roof tile, big-top canvas and dye beds.
+# They're new, so their colours live here. The ashlar is kept visibly warmer than the city's grey stone.
+COLLEGE_COLORS = {"MAT_AP_Ashlar": (0.80, 0.60, 0.34, 1.0), "MAT_AP_Verdigris": (0.12, 0.45, 0.32, 1.0),
+                  "MAT_AP_Timber": (0.55, 0.32, 0.12, 1.0), "MAT_AP_Brick": (0.45, 0.17, 0.10, 1.0),
+                  "MAT_AP_PlasterOchre": (0.80, 0.58, 0.25, 1.0), "MAT_AP_PlasterRose": (0.78, 0.42, 0.40, 1.0),
+                  "MAT_AP_PlasterTeal": (0.30, 0.55, 0.55, 1.0), "MAT_AP_RoofTile": (0.55, 0.20, 0.10, 1.0),
+                  "MAT_AP_Canvas": (0.85, 0.20, 0.18, 1.0), "MAT_AP_DyeBed": (0.35, 0.15, 0.55, 1.0),
+                  "MAT_AP_Clerestory": (0.02, 0.18, 1.00, 1.0), "MAT_AP_Turf": (0.20, 0.62, 0.05, 1.0),
+                  "MAT_AP_Boardwalk": (0.85, 0.60, 0.28, 1.0)}
+# matte like the rest of the scene (a new material's default 0.5 caught the sky and washed the colours out)
+COLLEGE_ROUGHNESS = 0.85
+COLLEGE_ROUGH = {"MAT_AP_Verdigris": 0.65, "MAT_AP_Clerestory": 0.35}
+# the clerestories glow in their own colour, so they read as a bright band from the air
+COLLEGE_EMISSION = {"MAT_AP_Clerestory": 0.8}
+
+
+def college_palette():
+    """Colours, roughness and glow for the college materials. Creates or updates (idempotent)."""
+    for name, rgba in COLLEGE_COLORS.items():
+        m = get_mat(name)
+        set_base_color(m, rgba)
+        bsdf = next((n for n in m.node_tree.nodes if n.type == "BSDF_PRINCIPLED"), None)
+        if bsdf is None:
+            continue
+        bsdf.inputs["Roughness"].default_value = COLLEGE_ROUGH.get(name, COLLEGE_ROUGHNESS)
+        if "Transmission Weight" in bsdf.inputs:
+            bsdf.inputs["Transmission Weight"].default_value = 0.0
+        if "Emission Color" in bsdf.inputs:
+            glow = COLLEGE_EMISSION.get(name, 0.0)
+            bsdf.inputs["Emission Color"].default_value = rgba if glow else (0.0, 0.0, 0.0, 1.0)
+            bsdf.inputs["Emission Strength"].default_value = glow
+
+
+def ground_material(name, dirt):
+    """Grass with large soft patches of bare earth, mapped in world space so the patches keep their
+    size on any mesh; `dirt` is the share of bare ground (0-1). Rebuilt each run (idempotent)."""
+    m = get_mat(name)
+    m.use_nodes = True
+    N, L = m.node_tree.nodes, m.node_tree.links
+    N.clear()
+    out, bsdf = N.new("ShaderNodeOutputMaterial"), N.new("ShaderNodeBsdfPrincipled")
+    geo = N.new("ShaderNodeNewGeometry")
+    patch = N.new("ShaderNodeTexNoise"); patch.inputs["Scale"].default_value = 0.02; patch.inputs["Detail"].default_value = 3
+    tone = N.new("ShaderNodeTexNoise"); tone.inputs["Scale"].default_value = 0.15; tone.inputs["Detail"].default_value = 2
+    ramp = N.new("ShaderNodeValToRGB")
+    ramp.color_ramp.elements[0].position = max(0.0, 1.0 - dirt - 0.05)
+    ramp.color_ramp.elements[1].position = min(1.0, 1.0 - dirt + 0.05)
+    ramp.color_ramp.elements[0].color, ramp.color_ramp.elements[1].color = GRASS_COLOR, DIRT_COLOR
+    vary = N.new("ShaderNodeMix"); vary.data_type = "RGBA"; vary.blend_type = "MULTIPLY"
+    vary.inputs["Factor"].default_value = 0.25
+    L.new(geo.outputs["Position"], patch.inputs["Vector"])
+    L.new(geo.outputs["Position"], tone.inputs["Vector"])
+    L.new(patch.outputs["Fac"], ramp.inputs["Fac"])
+    L.new(ramp.outputs["Color"], vary.inputs["A"])
+    L.new(tone.outputs["Color"], vary.inputs["B"])
+    L.new(vary.outputs["Result"], bsdf.inputs["Base Color"])
+    bsdf.inputs["Roughness"].default_value = 0.95
+    L.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
+    m.diffuse_color = GRASS_COLOR
+    return m
+
+
+def ground_palette():
+    """Basic colours for roads, paving and the bare ground rings. Idempotent."""
+    set_base_color(get_mat("MAT_AP_Grout"), ROAD_COLOR)
+    set_base_color(get_mat("MAT_AP_Paver"), PAVER_COLOR)
+    water = get_mat("MAT_AP_Water")
+    set_base_color(water, WATER["Base Color"])
+    bsdf = next((n for n in water.node_tree.nodes if n.type == "BSDF_PRINCIPLED"), None)
+    if bsdf is not None:
+        for key, val in WATER.items():
+            if key != "Base Color":
+                bsdf.inputs[key].default_value = val
+    mats = {"MAT_AP_GroundOrchard": ground_material("MAT_AP_GroundOrchard", 0.45),
+            "MAT_AP_GroundMeadow": ground_material("MAT_AP_GroundMeadow", 0.12),
+            "MAT_AP_Paver": get_mat("MAT_AP_Paver"), "MAT_AP_Water": water}
+    for oname, mname in GROUND.items():
+        o = bpy.data.objects.get(oname)
+        if o is None or o.type != "MESH":
+            continue
+        if o.data.materials:
+            o.data.materials[0] = mats[mname]
+        else:
+            o.data.materials.append(mats[mname])
+
+
+def hide_temple():
+    """Old Town replaces the temple: exclude 05_TEMPLE and hide its kit parts. Idempotent and recoverable."""
+    lc = bpy.context.view_layer.layer_collection.children.get("05_TEMPLE")
+    if lc is not None:
+        lc.exclude = True
+    for o in bpy.data.objects:
+        if o.name.startswith("KIT_PlantI_temple_"):
+            o.hide_viewport = True
+            o.hide_render = True
+
+
+class MeshBuilder:
+    """Collects prisms/solids as plain vertex and face lists, then makes one mesh with from_pydata
+    (much faster than bmesh at city scale). Footprints are wound counter-clockwise so normals face out."""
+
+    def __init__(self):
+        self.v, self.f, self.m = [], [], []
+
+    def _faces(self, bot, top, mi):
+        n = len(top)
+        self.f.append(top)
+        self.f.append(list(reversed(bot)))
+        for i in range(n):
+            j = (i + 1) % n
+            self.f.append([bot[i], bot[j], top[j], top[i]])
+        self.m.extend([mi] * (n + 2))
+
+    def prism(self, poly, z0, z1, mi):
+        n = len(poly)
+        area = sum(poly[i][0] * poly[(i + 1) % n][1] - poly[(i + 1) % n][0] * poly[i][1] for i in range(n))
+        if abs(area) < 1e-6:
+            return
+        if area < 0:
+            poly = list(reversed(poly))
+        k = len(self.v)
+        self.v.extend((CX + x, CY + y, z0) for x, y in poly)
+        self.v.extend((CX + x, CY + y, z1) for x, y in poly)
+        self._faces(list(range(k, k + n)), list(range(k + n, k + 2 * n)), mi)
+
+    def solid(self, top, bot, mi):
+        """A prism whose corners each have their own top and bottom height (any number of corners)."""
+        n = len(top)
+        area = sum(top[i][0] * top[(i + 1) % n][1] - top[(i + 1) % n][0] * top[i][1] for i in range(n))
+        if abs(area) < 1e-6:
+            return
+        pairs = list(zip(top, bot))
+        if area < 0:
+            pairs.reverse()
+        k = len(self.v)
+        self.v.extend((CX + x, CY + y, zb) for (x, y, _), zb in pairs)
+        self.v.extend((CX + x, CY + y, z) for (x, y, z), _ in pairs)
+        self._faces(list(range(k, k + n)), list(range(k + n, k + 2 * n)), mi)
+
+    def loft(self, rings, mi):
+        """Rings of equal length joined in order (quads between neighbours), capped at both ends."""
+        if len(rings) < 2 or any(len(r) != len(rings[0]) for r in rings):
+            return
+        n, k = len(rings[0]), len(self.v)
+        for r in rings:
+            self.v.extend((CX + x, CY + y, z) for x, y, z in r)
+        for i in range(len(rings) - 1):
+            a, b = k + i * n, k + (i + 1) * n
+            for j in range(n):
+                self.f.append([a + j, a + (j + 1) % n, b + (j + 1) % n, b + j])
+        self.f.append(list(range(k, k + n))[::-1])
+        last = k + (len(rings) - 1) * n
+        self.f.append(list(range(last, last + n)))
+        self.m.extend([mi] * ((len(rings) - 1) * n + 2))
+
+    def emit(self, name, coll, props=None):
+        me = bpy.data.meshes.new(name)
+        me.from_pydata(self.v, [], self.f)
+        me.polygons.foreach_set("material_index", self.m)
+        for mat in MATS:
+            me.materials.append(mat)
+        me.update()
+        ob = bpy.data.objects.new(name, me)
+        ob["citygen"] = True
+        for key, val in (props or {}).items():
+            ob[key] = val
+        coll.objects.link(ob)
+        return ob
+
+
+DISTANCE_SIDES = 5  # crown: a 5-sided double cone (10 tris); trunk: an open triangular prism (6 tris)
+
+
+# species with no kit collection: their distance tree is made here from scratch
+PROCEDURAL_TREES = {"asset_Plant_pine"}
+PINE = {"height": 10.0, "radius": 2.2, "tiers": 3, "trunk": 0.25, "trunk_top": 3.0}
+
+
+def link_distance(ob):
+    """Put a distance tree in KIT_PLANT_DISTANCE, which is excluded from the view layer (idempotent)."""
+    ob["citygen"] = True
+    far = bpy.data.collections.get("KIT_PLANT_DISTANCE") or bpy.data.collections.new("KIT_PLANT_DISTANCE")
+    if far.name not in bpy.context.scene.collection.children:
+        bpy.context.scene.collection.children.link(far)
+    if ob.name not in far.objects:
+        far.objects.link(ob)
+    lc = bpy.context.view_layer.layer_collection.children.get(far.name)
+    if lc:
+        lc.exclude = True  # source meshes only: seen through the scatter, never at the origin
+    return ob
+
+
+def pine_distance_tree():
+    """KIT_PlantD_pine: a conifer of 3 stacked 5-sided cones (10 m tall, 2.2 m at the base) in MAT_AP_LeafC
+    over a triangular MAT_AP_Bark trunk, about 36 tris. Gets or creates the mesh and object (idempotent).
+    Both materials are the kit trees' shared ones, used as they are: never recoloured here."""
+    name = "KIT_PlantD_pine"
+    me = bpy.data.meshes.get(name) or bpy.data.meshes.new(name)
+    me.clear_geometry()
+    me.materials.clear()
+    n, H, R, T = DISTANCE_SIDES, PINE["height"], PINE["radius"], PINE["tiers"]
+    verts, faces, mat_idx = [], [], []
+    # tier i: a cone whose skirt sits lower and wider the nearer the ground; each tier's apex is above
+    # the next tier's skirt, so they overlap like a fir's whorls. The bottom skirt is at 2 m.
+    for i in range(T):
+        zb = 2.0 + (H - 2.0) * 0.6 * i / T
+        zt = H if i == T - 1 else zb + (H - 2.0) * 0.55
+        r = R * (1.0 - 0.3 * i)
+        b = len(verts)
+        verts += [(r * math.cos(a), r * math.sin(a), zb) for a in (2 * math.pi * k / n for k in range(n))]
+        verts += [(0.0, 0.0, zt), (0.0, 0.0, zb)]
+        faces += [(b + k, b + (k + 1) % n, b + n) for k in range(n)] + [(b + (k + 1) % n, b + k, b + n + 1) for k in range(n)]
+        mat_idx += [0] * (2 * n)
+    b, tr = len(verts), PINE["trunk"]
+    verts += [(tr * math.cos(a), tr * math.sin(a), z) for z in (0.0, PINE["trunk_top"]) for a in (2 * math.pi * k / 3 for k in range(3))]
+    faces += [(b + k, b + (k + 1) % 3, b + 3 + (k + 1) % 3, b + 3 + k) for k in range(3)]
+    mat_idx += [1] * 3
+    me.from_pydata(verts, [], faces)
+    for m in (get_mat("MAT_AP_LeafC"), get_mat("MAT_AP_Bark")):
+        me.materials.append(m)
+    me.polygons.foreach_set("material_index", mat_idx)
+    me.update()
+    ob = bpy.data.objects.get(name) or bpy.data.objects.new(name, me)
+    ob.data = me
+    return link_distance(ob)
+
+
+def distance_tree(asset):
+    """One merged low-poly mesh per plant species for city-scale views: the species' trunk and crown
+    sized from its detailed kit parts (bounding boxes), about 16 tris instead of 36-164 in 2-3 objects.
+    The detailed kit collection is left untouched for close-up (hero) trees later. A species in
+    PROCEDURAL_TREES with no kit collection is made from scratch (the pine)."""
+    if asset not in bpy.data.collections:
+        return pine_distance_tree() if asset in PROCEDURAL_TREES else None
+    src = bpy.data.collections[asset]
+    trunk = crown = None
+    for o in src.all_objects:
+        if o.type != "MESH":
+            continue
+        if "trunk" in o.name:
+            trunk = o
+        elif "leaf" in o.name and (crown is None or o.dimensions.z * o.dimensions.x > crown.dimensions.z * crown.dimensions.x):
+            crown = o
+    if crown is None:
+        return None
+    name = f"KIT_PlantD_{asset[len('asset_Plant_'):]}"
+    me = bpy.data.meshes.get(name) or bpy.data.meshes.new(name)
+    me.clear_geometry()
+    me.materials.clear()
+    lo = [min(c[i] for c in crown.bound_box) for i in range(3)]
+    hi = [max(c[i] for c in crown.bound_box) for i in range(3)]
+    cx, cy = (lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2
+    rx, ry = (hi[0] - lo[0]) / 2, (hi[1] - lo[1]) / 2
+    zb, zt = lo[2], hi[2]
+    zm = zb + (zt - zb) * 0.4  # widest ring, a little below the middle like a broad crown
+    verts = [(cx + rx * math.cos(a), cy + ry * math.sin(a), zm) for a in (2 * math.pi * k / DISTANCE_SIDES for k in range(DISTANCE_SIDES))]
+    verts += [(cx, cy, zt), (cx, cy, zb)]
+    n = DISTANCE_SIDES
+    faces = [(k, (k + 1) % n, n) for k in range(n)] + [((k + 1) % n, k, n + 1) for k in range(n)]
+    mat_idx = [0] * len(faces)
+    mats = [crown.data.materials[0]]
+    if trunk is not None:
+        tr = max(trunk.dimensions.x, trunk.dimensions.y) / 2
+        tz = min(c[2] for c in trunk.bound_box)
+        b = len(verts)
+        verts += [(tr * math.cos(a), tr * math.sin(a), z) for z in (tz, zm) for a in (2 * math.pi * k / 3 for k in range(3))]
+        faces += [(b + k, b + (k + 1) % 3, b + 3 + (k + 1) % 3, b + 3 + k) for k in range(3)]
+        mat_idx += [1] * 3
+        mats.append(trunk.data.materials[0])
+    me.from_pydata(verts, [], faces)
+    for m in mats:
+        me.materials.append(m)
+    me.polygons.foreach_set("material_index", mat_idx)
+    me.update()
+    ob = bpy.data.objects.get(name) or bpy.data.objects.new(name, me)
+    ob.data = me
+    return link_distance(ob)
+
+
+def scatter_group(asset):
+    """Geometry Nodes group that instances one plant species on every point, using the points'
+    rot (Z, radians) and scale attributes. Uses the species' distance tree (one instance per point);
+    falls back to the detailed kit collection when the kit has no crown to size it from."""
+    name = f"CITYGEN_scatter_{asset}"
+    ng = bpy.data.node_groups.get(name) or bpy.data.node_groups.new(name, "GeometryNodeTree")
+    ng.nodes.clear()  # rebuilt every run, so a rebuild picks up the distance trees
+    if not ng.interface.items_tree:
+        ng.interface.new_socket("Geometry", in_out="INPUT", socket_type="NodeSocketGeometry")
+        ng.interface.new_socket("Geometry", in_out="OUTPUT", socket_type="NodeSocketGeometry")
+    N, L = ng.nodes, ng.links
+    gi, go = N.new("NodeGroupInput"), N.new("NodeGroupOutput")
+    far = distance_tree(asset)
+    if far is not None:
+        ci = N.new("GeometryNodeObjectInfo")
+        ci.inputs["Object"].default_value = far
+        ci.inputs["As Instance"].default_value = True
+        ci.transform_space = "ORIGINAL"
+    else:
+        ci = N.new("GeometryNodeCollectionInfo")
+        ci.inputs["Collection"].default_value = bpy.data.collections[asset]
+        ci.inputs["Reset Children"].default_value = True
+    iop = N.new("GeometryNodeInstanceOnPoints")
+    rot = N.new("GeometryNodeInputNamedAttribute"); rot.data_type = "FLOAT"; rot.inputs["Name"].default_value = "rot"
+    scl = N.new("GeometryNodeInputNamedAttribute"); scl.data_type = "FLOAT"; scl.inputs["Name"].default_value = "scale"
+    comb = N.new("ShaderNodeCombineXYZ")
+    L.new(gi.outputs[0], iop.inputs["Points"])
+    L.new(ci.outputs["Geometry"], iop.inputs["Instance"])
+    L.new(rot.outputs["Attribute"], comb.inputs["Z"])
+    L.new(comb.outputs[0], iop.inputs["Rotation"])
+    L.new(scl.outputs["Attribute"], iop.inputs["Scale"])
+    L.new(iop.outputs[0], go.inputs[0])
+    return ng
+
+
+def build():
+    colls = {k: reset_collection(v) for k, v in COLL.items() if k != "regrade"}
+    for ob in B["objects"]:
+        mb = MeshBuilder()
+        for p in ob["prims"]:
+            mi = MAT_KEYS.index(p["m"]) if p["m"] in MAT_KEYS else 0
+            if p["t"] == "prism":
+                mb.prism(p["poly"], p["z0"], p["z1"], mi)
+            elif p["t"] == "loft":
+                mb.loft(p["rings"], mi)
+            else:
+                mb.solid(p["top"], p["bot"], mi)
+        if mb.f:
+            mb.emit(ob["name"], colls[ob["coll"]], ob.get("props"))
+    # trees: one point cloud per (collection, species), instanced by Geometry Nodes
+    groups = {}
+    for it in B["instances"]:
+        groups.setdefault((it["coll"], it["asset"]), []).append(it)
+    for (cname, asset), items in groups.items():
+        if asset not in bpy.data.collections and asset not in PROCEDURAL_TREES:
+            print("missing plant collection", asset)
+            continue
+        me = bpy.data.meshes.new(f"TREES_{cname}_{asset}")
+        me.from_pydata([(CX + it["x"], CY + it["y"], it["z"]) for it in items], [], [])
+        for attr in ("rot", "scale"):
+            a = me.attributes.new(attr, "FLOAT", "POINT")
+            a.data.foreach_set("value", [it[attr] for it in items])
+        ob = bpy.data.objects.new(f"TREES_{cname}_{asset}", me)
+        ob["citygen"] = True
+        ob.modifiers.new("scatter", "NODES").node_group = scatter_group(asset)
+        colls[cname].objects.link(ob)
+    for o in bpy.data.objects:
+        if o.name.startswith("KIT_Facade_civic_i_AP_arc_"):
+            o.hide_viewport = o.hide_render = True
+    print("built", {v.name: len(v.objects) for v in colls.values()}, "trees", len(B["instances"]))
+
+
+# the generated canals and harbour channels have to show through the hand-built ground decks and the
+# ring-canal banks, walls and terraces: a hidden cutter mesh and a Boolean modifier on each of those
+# (non-destructive, so a rebuild just refreshes the cutter)
+CUT_TARGET_COLLS = ("01_GROUND", "10_KIT_CANAL", "11_TERRACE")
+CUT_SKIP = ("gallery", "oculus")
+
+
+def cut_canals():
+    cuts = B.get("canal_cuts") or []
+    old = bpy.data.objects.get("CANAL_CUTTER")
+    if old:
+        me_old = old.data
+        bpy.data.objects.remove(old)
+        if me_old and me_old.users == 0:
+            bpy.data.meshes.remove(me_old)
+    if not cuts:
+        return
+    mb = MeshBuilder()
+    for c in cuts:
+        mb.prism(c["poly"], c["z0"], c["z1"], 0)
+    coll = bpy.data.collections.get("27_CANAL_CUTS") or bpy.data.collections.new("27_CANAL_CUTS")
+    if coll.name not in bpy.context.scene.collection.children:
+        bpy.context.scene.collection.children.link(coll)
+    cutter = mb.emit("CANAL_CUTTER", coll, {"citygen": True})
+    cutter.display_type = "WIRE"
+    cutter.hide_render = True
+    coll.hide_render = True
+    n = 0
+    for cn in CUT_TARGET_COLLS:
+        c = bpy.data.collections.get(cn)
+        if not c:
+            continue
+        for o in c.all_objects:
+            if o.type != "MESH" or any(k in o.name.lower() for k in CUT_SKIP):
+                continue
+            m = o.modifiers.get("canal_cut") or o.modifiers.new("canal_cut", "BOOLEAN")
+            m.operation, m.object, m.solver = "DIFFERENCE", cutter, "EXACT"
+            m.use_self, m.use_hole_tolerant = True, True
+            n += 1
+    cutter.hide_set(True)
+    print("canal cuts", len(cuts), "on", n, "objects")
+
+
+CENTRE_KEEP = {"AP_inner_water", "KIT_Terrace_island"}  # the first ring canal's water and its college-side bank
+STRAY_TYPES = {"MESH", "CURVE", "SURFACE", "FONT", "META"}
+
+
+def xy_reach(o):
+    """Closest world-space XY distance from the city centre (CX, CY) to the object's geometry: meshes by
+    their edges (0 when a face covers the centre), collection instances and other types by their box."""
+    import numpy as np
+    M = np.array(o.matrix_world)
+    if o.type == "MESH" and o.data and len(o.data.vertices):
+        me = o.data
+        co = np.empty(len(me.vertices) * 3)
+        me.vertices.foreach_get("co", co)
+        xy = (co.reshape(-1, 3) @ M[:3, :3].T + M[:3, 3])[:, :2] - (CX, CY)
+        best = float(np.hypot(xy[:, 0], xy[:, 1]).min())
+        if len(me.edges):
+            e = np.empty(len(me.edges) * 2, dtype=np.int64)
+            me.edges.foreach_get("vertices", e)
+            e = e.reshape(-1, 2)
+            a, d = xy[e[:, 0]], xy[e[:, 1]] - xy[e[:, 0]]
+            t = np.clip(-(a * d).sum(1) / np.maximum((d * d).sum(1), 1e-12), 0, 1)
+            p = a + d * t[:, None]
+            best = min(best, float(np.hypot(p[:, 0], p[:, 1]).min()))
+        if len(me.polygons):
+            # a face covers the centre when a ray from it along +x crosses the face's boundary an odd number of times
+            lv = np.empty(len(me.loops), dtype=np.int64)
+            me.loops.foreach_get("vertex_index", lv)
+            ls, lt = np.empty(len(me.polygons), dtype=np.int64), np.empty(len(me.polygons), dtype=np.int64)
+            me.polygons.foreach_get("loop_start", ls)
+            me.polygons.foreach_get("loop_total", lt)
+            poly = np.repeat(np.arange(len(ls)), lt)
+            nxt = np.arange(len(lv)) + 1
+            nxt[ls + lt - 1] = ls
+            a, b = xy[lv], xy[lv[nxt]]
+            cross = (a[:, 1] > 0) != (b[:, 1] > 0)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                xi = a[:, 0] - a[:, 1] * (b[:, 0] - a[:, 0]) / (b[:, 1] - a[:, 1])
+            hits = np.bincount(poly[cross & (xi > 0)], minlength=len(ls))
+            if (hits % 2).any():
+                best = 0.0
+        return best
+    pts = footprint_world(o) if o.type == "EMPTY" else [o.matrix_world @ Vector(c) for c in o.bound_box]
+    xs, ys = [p.x - CX for p in pts], [p.y - CY for p in pts]
+    return math.hypot(max(min(xs), 0, -max(xs)), max(min(ys), 0, -max(ys)))
+
+
+def hide_centre_strays(dry_run=False):
+    """Spec §7: after building, any visible non-generated object reaching inside the first ring canal
+    (r < the innermost water band's inner edge, 460) other than the canal water and its bank is reported
+    and hidden the recoverable way (hide_viewport / hide_render). Idempotent; never deletes."""
+    r_in = min(r0 for r0, _ in WATER_BANDS)
+    found = []
+    for o in bpy.data.objects:
+        if o.name in CENTRE_KEEP or o.get("citygen") or is_source(o) or not o.visible_get():
+            continue
+        if o.type not in STRAY_TYPES and not (o.type == "EMPTY" and o.instance_collection):
+            continue
+        if any(c.name in GENERATED for c in o.users_collection):
+            continue
+        r = xy_reach(o)
+        if r < r_in:
+            found.append((o.name, collection_of(o), round(r, 1)))
+            if not dry_run:
+                o.hide_viewport = o.hide_render = True
+    print("centre strays inside r <", r_in, ":", found if found else "none")
+    return found
+
+
+def main():
+    global MATS
+    ensure_glow()
+    ground_palette()
+    college_palette()
+    MATS = [get_mat(MAT[k]) for k in MAT_KEYS]
+    if globals().get("DO_REGRADE", True):
+        regrade()
+    if globals().get("DO_BUILD", True):
+        hide_temple()
+        build()
+        cut_canals()
+        hide_centre_strays()
+
+
+main()
